@@ -258,7 +258,7 @@ void lcd_worker() {
     lcd.print(cBuffer);
 
     // Temperature
-    snprintf(&cBuffer[0],40,"%d.%dC %dhPa %d%%", (uint8_t)bme_temp, (uint8_t)(10*bme_temp)-(((uint8_t)bme_temp)*10), (uint16_t)bme_pres, (uint8_t)bme_humi );
+    snprintf(&cBuffer[0],40,"%d.%dC %dhPa %d%%", (uint8_t)bme_temp, (uint16_t)(10*bme_temp)-(((uint16_t)bme_temp)*10), (uint16_t)bme_pres, (uint8_t)bme_humi );
 
     lcd.setCursor(20,1);
     if (strlen(cBuffer) < 20) for (uint8_t i=0;i<20-strlen(cBuffer);i++) lcd.print(" "); // right-align
@@ -360,16 +360,48 @@ void loop() {
         bme_worker();
         lcd_worker();
 
-#if 0
+#if 1
         // Serial input parser
         if (Serial.available() > 0) {
-            int inByte;
+            int   inByte;
+            bool  UpdateTime = false;
+            uint16_t  Year;
+            uint8_t   Month;
+            uint8_t   Day;
+            uint8_t   Hour;
+            uint8_t   Minute;
+            uint8_t   Second;
 
             inByte = Serial.read();
 
-            // say what you got:
-            Serial.print("I received: ");
-            Serial.println(inByte, DEC);
+            DateTime rtc_new = rtc.now();
+
+            Year   = rtc_new.year();
+            Month  = rtc_new.month();
+            Day    = rtc_new.day();
+            Hour   = rtc_new.hour();
+            Minute = rtc_new.minute();
+            Second = rtc_new.second();
+
+            switch (inByte) {
+              case 'y': Year--;     UpdateTime=true;  break;
+              case 'Y': Year++;     UpdateTime=true;  break;
+              case 'o': Month--;    UpdateTime=true;  break;
+              case 'O': Month++;    UpdateTime=true;  break;
+              case 'd': Day--;      UpdateTime=true;  break;
+              case 'D': Day++;      UpdateTime=true;  break;
+              case 'h': Hour--;     UpdateTime=true;  break;
+              case 'H': Hour++;     UpdateTime=true;  break;
+              case 'm': Minute--;   UpdateTime=true;  break;
+              case 'M': Minute++;   UpdateTime=true;  break;
+              case 's': Second--;   UpdateTime=true;  break;
+              case 'S': Second++;   UpdateTime=true;  break;
+            } // switch
+
+            if (UpdateTime) {
+              DateTime NewTime(Year, Month, Day, Hour, Minute, Second);
+              rtc.adjust(NewTime);
+            }
         }
 #endif
         delay(25);
