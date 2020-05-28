@@ -4,18 +4,27 @@
  * - HD44780 LCD 40x4
  * - RTC DS1307
  * - BME280 (Humidty, Pressure, Temperature) at address 0x76
+ * - Dust-Sensor
  * 
- * Remarks:
- * - The 40x4 is technically a 80x2, so setCursor and line overflow won't work as expected
- *   Line 3 is basically the second half of line 1, and line 4 is the second half of line 2
+ * Connections
+
+ *   2 .. ENC_A
+ *   3 .. ENC_B
+ *   4 .. LCD_DB4
+ *   5 .. LCD_DB5
+ *   6 .. LCD_DB6
+ *   7 .. LCD_DB7
+ *   8 .. LCD_RS
+ *   9 .. LCD_EN
+ *
+ *  11 .. DUST_LED
  * 
- * LCD Connections:
- *  8 .. RS
- *  9 .. EN
- *  4 .. DB4
- *  5 .. DB5
- *  6 .. DB6
- *  7 .. DB7
+ *  18 .. ENC_Key
+ * 
+ *  20 .. SDA
+ *  21 .. SCL
+ * 
+ *  A5 .. DUST_INPUT
  */
 
 #include <hd44780.h>
@@ -27,8 +36,22 @@
  * Defines
  *******************************************************/
 #define             LCD_CUSTCHARS           8               //< The amount of custom chars for the LCD
-#define             BME_RATE                60              //< The BME is updated every 60 secs
-#define             LCD_LINEOFFSET          20              //< The offset to get into Line 3 and 4
+#define             BME_RATE                60              //< Update rate of the BME
+#define             DUST_RATE               15              //< Update rate of the dust sensor
+#define             LCD_RS                  8               //< GPIO for the LCD RS
+#define             LCD_EN                  9               //< GPIO for the LCD EN
+#define             LCD_D4                  4               //< GPIO for the LCD Data 4
+#define             LCD_D5                  5               //< GPIO for the LCD Data 5
+#define             LCD_D6                  6               //< GPIO for the LCD Data 6
+#define             LCD_D7                  7               //< GPIO for the LCD Data 7
+#define             ENC_A                   2               //< GPIO for the encoder A signal (Int required!)
+#define             ENC_B                   10              //< GPIO for the encoder B signal
+#define             ENC_KEY                 3               //< GPIO for the encoder key (Int required!)
+#define             DUST_INPUT              A5              //< AnaIn for the dust sensor
+#define             DUST_LED                11              //< LED-Out for the dust sensor
+#define             DUST_COV_RATIO          0.166           //< Dust-Sensor: ug/mmm / mv
+#define             DUST_NO_DUST            600             //< "No Dust" Voltage [mv]
+#define             DUST_VOLTAGE            5000            //< Voltage of the dust sensor
 
 /*******************************************************
  * Statics
@@ -63,22 +86,24 @@ static uint8_t CustNumbers[10][9] = {                       // The segments of t
  * Local variables
  *******************************************************/
 RTC_DS1307          rtc;                                    //< The RTC object
-hd44780_pinIO       lcd(8, 9, 4, 5, 6, 7);                  //< The LCD object
+hd44780_pinIO       lcd(LCD_RS, LCD_EN, LCD_D4, LCD_D5, LCD_D6, LCD_D7); //< The LCD object
 Adafruit_BME280     bme;                                    //< The BME object
 DateTime            time_now;                               //< The current time
-
 uint32_t            lcd_update = 0;                         //< Timestamp of the last LCD update
 uint32_t            bme_update = 0;                         //< Timestamp of the last BME reading
+uint32_t            dust_update = 0;                        //< Timestamp of the last Dust-Sensor reading
 float               bme_temp = 0.0;                         //< The current temperature
 float               bme_pres = 0.0;                         //< The current pressure
 float               bme_humi = 0.0;                         //< The current humidity
-
+volatile int32_t    enc_count = 0;                          //< The counter for the encoder
+volatile bool       enc_keypressed = false;                 //< The encoder-key was pressed
+float               dust_density = 0.0;                     //< The measured density
 
 /*******************************************************
  * RTC
  *******************************************************/
 /********************************* Setup */
-void setup_rtc() {
+void rtc_setup() {
     // Init RTC
     if (! rtc.begin()) {
         Serial.println(F("[RTC] Couldn't find RTC"));
@@ -87,11 +112,10 @@ void setup_rtc() {
     }
     if (!rtc.isrunning()) {
         Serial.println(F("[RTC] RTC is NOT running!"));
-        // Adjust to build date/time
-        rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+        rtc.adjust(DateTime(F(__DATE__), F(__TIME__))); // Adjust to build date/time
     }
     rtc.writeSqwPinMode(DS1307_OFF); // No Sqw-Output
-} // setup_rtc
+} // rtc_setup
 /*******************************************************
  * LCD
  *******************************************************/
@@ -108,7 +132,7 @@ void lcd_printdigit(uint8_t Col, uint8_t Digit) {
   lcd.write(CustNumbers[Digit][3]);
   lcd.write(CustNumbers[Digit][4]);
   lcd.write(CustNumbers[Digit][5]);
-  lcd.setCursor(Col+LCD_LINEOFFSET,0);
+  lcd.setCursor(Col,2);
   lcd.write(CustNumbers[Digit][6]);
   lcd.write(CustNumbers[Digit][7]);
   lcd.write(CustNumbers[Digit][8]);
@@ -116,11 +140,11 @@ void lcd_printdigit(uint8_t Col, uint8_t Digit) {
   return;
 } // lcd_printdigit
 /********************************* Setup */
-void setup_lcd() {
+void lcd_setup() {
   // Init lcd object and create custom chars
-  lcd.begin(80, 2);
+  lcd.begin(20, 4);
   for (uint8_t i=0;i<LCD_CUSTCHARS; i++) lcd.createChar(i, CustChars[i]);
-} // setup_lcd
+} // lcd_setup
 /********************************* Worker */
 void lcd_worker() {
   static uint8_t    dispmode=0;
@@ -134,10 +158,9 @@ void lcd_worker() {
   // Display mode: switch between temp, pressure, humidity every 5 secs
   if (lcd_update%5==0) {
     dispmode++;
-    if (dispmode>2) dispmode=0;
+    if (dispmode>3) dispmode=0;
   }
 
-//  lcd.clear(); 
   lcd.setCursor(0,0);
 
   // Time
@@ -163,7 +186,7 @@ void lcd_worker() {
   // Date
   snprintf(&cBuffer[0],20,"%s,%02d.%02d.%02d",  lcd_DoW[time_now.dayOfTheWeek()], time_now.day(), time_now.month(), time_now.year()-2000  );
 
-  lcd.setCursor(LCD_LINEOFFSET,1); // Start of Line 4
+  lcd.setCursor(0,3); // Start of Line 4
   for (uint8_t i=0;i<(20-strlen(cBuffer));i++) lcd.print(" "); // print spaces to overwrite old stuff and make date right-align
   lcd.print(cBuffer);
 
@@ -171,24 +194,27 @@ void lcd_worker() {
     case 0: // Temperature
       snprintf(&cBuffer[0],20,"%d.%dC", (uint8_t)bme_temp, (uint16_t)(10*bme_temp)-(((uint16_t)bme_temp)*10) );
       break;
-    case 1:
+    case 1: // Pressure
       snprintf(&cBuffer[0],20,"%dhP", (uint16_t)bme_pres );
       break;
-    case 2:
+    case 2: // Humidity
       snprintf(&cBuffer[0],20,"%d%%", (uint16_t)bme_humi );
+      break;
+    case 3: // Dust density
+      snprintf(&cBuffer[0],20,"%d.%d", (uint8_t)dust_density, (uint16_t)(10*dust_density)-(((uint16_t)dust_density)*10) );
       break;
     default:
       dispmode=0;
       break;
   }
-  lcd.setCursor(LCD_LINEOFFSET,1); // Line 4
+  lcd.setCursor(0,3); // Line 4
   lcd.print(cBuffer);
 } // lcd_worker
 /*******************************************************
  * BME
  *******************************************************/
 /********************************* Setup */
-void setup_bme() {
+void bme_setup() {
     if (!bme.begin(0x76)) {
         Serial.println(F("[BME] Could not find a valid BME280 sensor, check wiring!"));
         while (1);
@@ -199,59 +225,160 @@ void setup_bme() {
                     Adafruit_BME280::SAMPLING_X1, // humidity
                     Adafruit_BME280::FILTER_OFF   );
     
-} // setup_bme
+} // bme_setup
 /********************************* Worker */
 void bme_worker() {
-    if (time_now.secondstime() <= bme_update+BME_RATE) return;   // Update time not yet reached
+  if (time_now.secondstime() <= bme_update+BME_RATE) return;   // Update time not yet reached
+  bme_update = time_now.secondstime();
 
-    bme_update = time_now.secondstime();
-    Serial.print(F("[BME] Updateing "));
+  Serial.print(F("[BME] Getting Measurements:  "));
 
-    bme.takeForcedMeasurement();
-    bme_temp = bme.readTemperature();
-    bme_pres = bme.readPressure()/100.0F;
-    bme_humi = bme.readHumidity();
+  bme.takeForcedMeasurement();
+  bme_temp = bme.readTemperature();
+  bme_pres = bme.readPressure()/100.0F;
+  bme_humi = bme.readHumidity();
 
-    Serial.print(bme_temp, DEC);
-    Serial.print(" dC ");
-    Serial.print(bme_pres, DEC);
-    Serial.print(" PA ");
-    Serial.print(bme_humi, DEC);
-    Serial.print(" %");
+  Serial.print(bme_temp, DEC);
+  Serial.print(" dC ");
+  Serial.print(bme_pres, DEC);
+  Serial.print(" PA ");
+  Serial.print(bme_humi, DEC);
+  Serial.print(" %");
 
-    Serial.println();
+  Serial.println();
 
 } // bme_worker
+/*******************************************************
+ * Dust-Sensor
+ *******************************************************/
+/********************************* Setup */
+void dust_setup() {
+  pinMode(DUST_LED, OUTPUT);
+} // dust_setup
+/********************************* Worker */
+void dust_worker() {
+  int AdcValue;
+  float density;
+  float voltage;
+
+  if (time_now.secondstime() <= dust_update+DUST_RATE) return;   // Update time not yet reached
+  dust_update = time_now.secondstime();
+
+  Serial.print(F("[DST] Getting Measurements:  "));
+
+
+  digitalWrite(DUST_LED, HIGH);             // Sensor LED ON
+  delayMicroseconds(280);                   // Wait 0.28ms for sampling
+  AdcValue = analogRead(DUST_INPUT);        // Get Sample
+  digitalWrite(DUST_LED, LOW);              // Sensor LED OFF
+
+  // Calculate measured voltage
+  voltage = (DUST_VOLTAGE / 1023.0) * AdcValue;
+
+  // Calculate density
+  if(voltage >= DUST_NO_DUST) {
+    density = (voltage-DUST_NO_DUST) * DUST_COV_RATIO;
+  }
+  else
+    density = 0;
+
+
+  Serial.print(F("Raw: "));
+  Serial.print(AdcValue, DEC);
+
+  Serial.print(F(" Voltage: "));
+  Serial.print(voltage, DEC);
+
+  Serial.print(F(" Density: "));
+  Serial.print(density, DEC);
+
+  Serial.println(" ug/m3");
+
+  dust_density = density;
+} // dust_worker
+/*******************************************************
+ * Encoder
+ *******************************************************/
+/********************************* Setup */
+void enc_setup() {
+  pinMode(ENC_KEY, INPUT_PULLUP);
+  pinMode(ENC_A, INPUT_PULLUP);
+  pinMode(ENC_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_KEY), enc_intkey, FALLING);
+  attachInterrupt(digitalPinToInterrupt(ENC_A),   enc_inta,   CHANGE);
+} // enc_setup
+/********************************* Int: Key */
+void enc_intkey() {
+  enc_keypressed=true;
+} // enc_intkey
+/********************************* Int: A-Signal */
+void enc_inta() {
+  static int OldA = HIGH;
+
+  // Falling Edge
+  if (OldA==HIGH &&  digitalRead(ENC_A) == LOW ) {
+    if (digitalRead(ENC_B)==HIGH) enc_count++;
+    if (digitalRead(ENC_B)==LOW) enc_count--;
+  }
+  // Rising Edge
+  if (OldA==LOW &&  digitalRead(ENC_A) == HIGH ) {
+    if (digitalRead(ENC_B)==LOW) enc_count++;
+    if (digitalRead(ENC_B)==HIGH) enc_count--;
+  }
+
+  OldA = digitalRead(ENC_A);
+
+  return;
+} // enc_inta
+/********************************* Worker */
+void enc_worker() {
+  static int32_t OldCount = 0;
+
+  // Handle keypresses
+  if (enc_keypressed) {
+    Serial.println(F("[ENC] Key was pressed!"));
+    enc_keypressed=false;
+  }
+
+  // Handle Encoder
+  if (OldCount!=enc_count) {
+    Serial.print(F("[ENC] Rotation: "));
+    Serial.println( (OldCount-enc_count), DEC);
+
+    OldCount = enc_count;
+  }
+  return;
+} // enc_worker
 /*******************************************************
  * Aux-Functions
  *******************************************************/
 /********************************* Startup Info */
 void start_info() {
-    uint8_t buffer[56];
-    
-    // Show Build-Info
-    Serial.println(F("Build: " __DATE__ " " __TIME__ ));
-    lcd.clear();
-    lcd.setCursor(0,0);
-    lcd.print(F("Build: "));
-    lcd.setCursor(0,1);
-    lcd.print(F(__DATE__));
-    lcd.setCursor(20,0);
-    lcd.print(F(__TIME__));
-    delay(1000);  
+  uint8_t buffer[56];
 
-    // Print out DS1307s NVRAM
-    rtc.readnvram(&buffer[0],56,0);
+  // Show Build-Info
+  Serial.println(F("Build: " __DATE__ " " __TIME__ ));
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print(F("Build: "));
+  lcd.setCursor(0,1);
+  lcd.print(F(__DATE__));
+  lcd.setCursor(0,2);
+  lcd.print(F(__TIME__));
+  delay(1000);  
 
-    Serial.print(F("[RTC] NVRAM:"));
-    for (uint8_t i=0;i<56;i++) {
-        if (i%8==0) Serial.println();
-        Serial.print(" ");
-        if (buffer[i]<0x0A) Serial.print("0");
-        Serial.print(buffer[i],HEX);
-    }
-    Serial.println();
-    lcd.clear();
+  // Print out DS1307s NVRAM
+  rtc.readnvram(&buffer[0],56,0);
+
+  Serial.print(F("[RTC] NVRAM:"));
+  for (uint8_t i=0;i<56;i++) {
+    if (i%8==0) Serial.println();
+    Serial.print(" ");
+    if (buffer[i]<0x0A) Serial.print("0");
+    Serial.print(buffer[i],HEX);
+  }
+  Serial.println();
+  lcd.clear();
 } // start_info
 /*******************************************************
  * Main stuff
@@ -262,9 +389,11 @@ void setup() {
     Serial.println(F("[SYS] Build: " __DATE__ " - " __TIME__));
     Serial.println(F("[SYS] Starting Setup..."));
 
-    setup_lcd();
-    setup_rtc();
-    setup_bme();
+    lcd_setup();
+    rtc_setup();
+    bme_setup();
+    enc_setup();
+    dust_setup();
 
     Serial.println(F("[SYS] Setup complete"));
 }
@@ -279,6 +408,8 @@ void loop() {
 
         bme_worker();
         lcd_worker();
+        enc_worker();
+        dust_worker();
 
 #if 1
         // Serial input parser
