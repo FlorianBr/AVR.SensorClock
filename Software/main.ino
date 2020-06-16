@@ -4,7 +4,6 @@
  * - HD44780 LCD 40x4
  * - RTC DS1307
  * - BME280 (Humidty, Pressure, Temperature) at address 0x76
- * - Dust-Sensor
  * 
  * Connections
 
@@ -17,14 +16,14 @@
  *   8 .. LCD_RS
  *   9 .. LCD_EN
  *
- *  11 .. DUST_LED
- * 
  *  18 .. ENC_Key
  * 
  *  20 .. SDA
  *  21 .. SCL
  * 
- *  A5 .. DUST_INPUT
+ * TODOs:
+ * - Do something useful with the encoders rotation
+ * 
  */
 
 #include <hd44780.h>
@@ -37,21 +36,15 @@
  *******************************************************/
 #define             LCD_CUSTCHARS           8               //< The amount of custom chars for the LCD
 #define             BME_RATE                60              //< Update rate of the BME
-#define             DUST_RATE               15              //< Update rate of the dust sensor
-#define             LCD_RS                  8               //< GPIO for the LCD RS
-#define             LCD_EN                  9               //< GPIO for the LCD EN
+#define             LCD_RS                  9               //< GPIO for the LCD RS
+#define             LCD_EN                  8               //< GPIO for the LCD EN
 #define             LCD_D4                  4               //< GPIO for the LCD Data 4
 #define             LCD_D5                  5               //< GPIO for the LCD Data 5
 #define             LCD_D6                  6               //< GPIO for the LCD Data 6
 #define             LCD_D7                  7               //< GPIO for the LCD Data 7
 #define             ENC_A                   2               //< GPIO for the encoder A signal (Int required!)
-#define             ENC_B                   10              //< GPIO for the encoder B signal
-#define             ENC_KEY                 3               //< GPIO for the encoder key (Int required!)
-#define             DUST_INPUT              A5              //< AnaIn for the dust sensor
-#define             DUST_LED                11              //< LED-Out for the dust sensor
-#define             DUST_COV_RATIO          0.166           //< Dust-Sensor: ug/mmm / mv
-#define             DUST_NO_DUST            600             //< "No Dust" Voltage [mv]
-#define             DUST_VOLTAGE            5000            //< Voltage of the dust sensor
+#define             ENC_B                   3               //< GPIO for the encoder B signal
+#define             ENC_KEY                 18              //< GPIO for the encoder key (Int required!)
 
 /*******************************************************
  * Statics
@@ -91,13 +84,12 @@ Adafruit_BME280     bme;                                    //< The BME object
 DateTime            time_now;                               //< The current time
 uint32_t            lcd_update = 0;                         //< Timestamp of the last LCD update
 uint32_t            bme_update = 0;                         //< Timestamp of the last BME reading
-uint32_t            dust_update = 0;                        //< Timestamp of the last Dust-Sensor reading
+uint8_t             lcd_currmode = 0;                       //< Current display mode
 float               bme_temp = 0.0;                         //< The current temperature
 float               bme_pres = 0.0;                         //< The current pressure
 float               bme_humi = 0.0;                         //< The current humidity
 volatile int32_t    enc_count = 0;                          //< The counter for the encoder
 volatile bool       enc_keypressed = false;                 //< The encoder-key was pressed
-float               dust_density = 0.0;                     //< The measured density
 
 /*******************************************************
  * RTC
@@ -145,21 +137,29 @@ void lcd_setup() {
   lcd.begin(20, 4);
   for (uint8_t i=0;i<LCD_CUSTCHARS; i++) lcd.createChar(i, CustChars[i]);
 } // lcd_setup
+/********************************* Display Mode */
+void lcd_dispmode(bool bForce) {
+  static uint32_t mode_time = 0;
+
+  if ((time_now.secondstime() <= mode_time+5) && (!bForce)) return; // Not yet or not forced
+  mode_time = time_now.secondstime();
+
+  lcd_currmode++;
+  if (lcd_currmode>2) lcd_currmode=0;
+
+  if (bForce) lcd_update = 0; // Forced switch? Force LCD update too
+
+} // lcd_dispmode
 /********************************* Worker */
 void lcd_worker() {
-  static uint8_t    dispmode=0;
   char              cBuffer[20];
   uint8_t           Digit1=0;
   uint8_t           Digit2=0;
 
+  lcd_dispmode(false);
+
   if (time_now.secondstime() == lcd_update) return; // Not yet
   lcd_update = time_now.secondstime();
-
-  // Display mode: switch between temp, pressure, humidity every 5 secs
-  if (lcd_update%5==0) {
-    dispmode++;
-    if (dispmode>3) dispmode=0;
-  }
 
   lcd.setCursor(0,0);
 
@@ -190,7 +190,7 @@ void lcd_worker() {
   for (uint8_t i=0;i<(20-strlen(cBuffer));i++) lcd.print(" "); // print spaces to overwrite old stuff and make date right-align
   lcd.print(cBuffer);
 
-  switch (dispmode) {
+  switch (lcd_currmode) {
     case 0: // Temperature
       snprintf(&cBuffer[0],20,"%d.%dC", (uint8_t)bme_temp, (uint16_t)(10*bme_temp)-(((uint16_t)bme_temp)*10) );
       break;
@@ -200,11 +200,7 @@ void lcd_worker() {
     case 2: // Humidity
       snprintf(&cBuffer[0],20,"%d%%", (uint16_t)bme_humi );
       break;
-    case 3: // Dust density
-      snprintf(&cBuffer[0],20,"%d.%d", (uint8_t)dust_density, (uint16_t)(10*dust_density)-(((uint16_t)dust_density)*10) );
-      break;
     default:
-      dispmode=0;
       break;
   }
   lcd.setCursor(0,3); // Line 4
@@ -248,54 +244,7 @@ void bme_worker() {
   Serial.println();
 
 } // bme_worker
-/*******************************************************
- * Dust-Sensor
- *******************************************************/
-/********************************* Setup */
-void dust_setup() {
-  pinMode(DUST_LED, OUTPUT);
-} // dust_setup
-/********************************* Worker */
-void dust_worker() {
-  int AdcValue;
-  float density;
-  float voltage;
 
-  if (time_now.secondstime() <= dust_update+DUST_RATE) return;   // Update time not yet reached
-  dust_update = time_now.secondstime();
-
-  Serial.print(F("[DST] Getting Measurements:  "));
-
-
-  digitalWrite(DUST_LED, HIGH);             // Sensor LED ON
-  delayMicroseconds(280);                   // Wait 0.28ms for sampling
-  AdcValue = analogRead(DUST_INPUT);        // Get Sample
-  digitalWrite(DUST_LED, LOW);              // Sensor LED OFF
-
-  // Calculate measured voltage
-  voltage = (DUST_VOLTAGE / 1023.0) * AdcValue;
-
-  // Calculate density
-  if(voltage >= DUST_NO_DUST) {
-    density = (voltage-DUST_NO_DUST) * DUST_COV_RATIO;
-  }
-  else
-    density = 0;
-
-
-  Serial.print(F("Raw: "));
-  Serial.print(AdcValue, DEC);
-
-  Serial.print(F(" Voltage: "));
-  Serial.print(voltage, DEC);
-
-  Serial.print(F(" Density: "));
-  Serial.print(density, DEC);
-
-  Serial.println(" ug/m3");
-
-  dust_density = density;
-} // dust_worker
 /*******************************************************
  * Encoder
  *******************************************************/
@@ -338,6 +287,7 @@ void enc_worker() {
   if (enc_keypressed) {
     Serial.println(F("[ENC] Key was pressed!"));
     enc_keypressed=false;
+    lcd_dispmode(true);
   }
 
   // Handle Encoder
@@ -393,7 +343,6 @@ void setup() {
     rtc_setup();
     bme_setup();
     enc_setup();
-    dust_setup();
 
     Serial.println(F("[SYS] Setup complete"));
 }
@@ -409,9 +358,7 @@ void loop() {
         bme_worker();
         lcd_worker();
         enc_worker();
-        dust_worker();
 
-#if 1
         // Serial input parser
         if (Serial.available() > 0) {
             int   inByte;
@@ -454,7 +401,7 @@ void loop() {
               rtc.adjust(NewTime);
             }
         }
-#endif
+
         delay(25);
     } // while (1)
 } // loop
