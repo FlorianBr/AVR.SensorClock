@@ -23,7 +23,7 @@
  * 
  * TODOs:
  * - Do something useful with the encoders rotation
- * 
+ * - Adding ESP for WIFI Connection
  */
 
 #include <hd44780.h>
