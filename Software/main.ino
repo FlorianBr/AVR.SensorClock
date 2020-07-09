@@ -45,6 +45,7 @@
 #define             ENC_A                   2               //< GPIO for the encoder A signal (Int required!)
 #define             ENC_B                   3               //< GPIO for the encoder B signal
 #define             ENC_KEY                 18              //< GPIO for the encoder key (Int required!)
+#define             SETTIMETIMEOUT          (5000)          //< Timeout for Set-Time in ms
 
 /*******************************************************
  * Statics
@@ -348,30 +349,47 @@ void setup() {
 }
 /********************************* Loop */
 void loop() {
-    Serial.println(F("[SYS] Entering Loop!"));
+  uint32_t  LastKeyTime = 0;
+  bool      SetTimeEnabled = false;
 
-    start_info();
+  Serial.println(F("[SYS] Entering Loop!"));
 
-    while (1) {
-        time_now = rtc.now();
+  start_info();
 
-        bme_worker();
-        lcd_worker();
-        enc_worker();
+  while (1) {
+      time_now = rtc.now();
 
-        // Serial input parser
-        if (Serial.available() > 0) {
-            int   inByte;
-            bool  UpdateTime = false;
-            uint16_t  Year;
-            uint8_t   Month;
-            uint8_t   Day;
-            uint8_t   Hour;
-            uint8_t   Minute;
-            uint8_t   Second;
+      bme_worker();
+      lcd_worker();
+      enc_worker();
 
-            inByte = Serial.read();
 
+      if ( (millis()>(LastKeyTime+SETTIMETIMEOUT)) && SetTimeEnabled) {
+        Serial.println(F("[SYS] Set-Time TIMEOUT!"));
+        SetTimeEnabled = false;
+      }
+
+      // Serial input parser
+      if (Serial.available() > 0) {
+          int   inByte;
+          bool  UpdateTime = false;
+          uint16_t  Year;
+          uint8_t   Month;
+          uint8_t   Day;
+          uint8_t   Hour;
+          uint8_t   Minute;
+          uint8_t   Second;
+
+          inByte = Serial.read();
+
+          LastKeyTime = millis();
+
+          if (inByte=='S') {
+            Serial.println(F("[SYS] Set-Time ENABLED!"));
+            SetTimeEnabled = true;
+          }
+
+          if (SetTimeEnabled) {
             DateTime rtc_new = rtc.now();
 
             Year   = rtc_new.year();
@@ -400,8 +418,9 @@ void loop() {
               DateTime NewTime(Year, Month, Day, Hour, Minute, Second);
               rtc.adjust(NewTime);
             }
+          } // SetTimeEnabled
         }
 
-        delay(25);
-    } // while (1)
+      delay(25);
+  } // while (1)
 } // loop
